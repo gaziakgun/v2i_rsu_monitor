@@ -9,6 +9,7 @@
   <buildtool_depend>ament_python</buildtool_depend>
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
+  <exec_depend>v2i_map_msgs</exec_depend>
   <exec_depend>v2i_sdsm_msgs</exec_depend>
   <exec_depend>v2i_spat_msgs</exec_depend>
   <exec_depend>pycmssdk</exec_depend>

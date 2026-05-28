@@ -3,10 +3,10 @@
 
 """
 ROS2 RSU SAE J2735 Monitor (MAP + SPaT + SDSM) — subscribes to topics instead of UDP
-Topics expected (message type: std_msgs/UInt8MultiArray):
-- v2i/sdsm/raw  -> SDSM
-- v2i/map/raw   -> MAP
-- v2i/spat/raw  -> SPAT
+Topics expected:
+- v2i/sdsm/raw  -> v2i_sdsm_msgs/SDSM, or std_msgs/UInt8MultiArray fallback
+- v2i/map/raw   -> v2i_map_msgs/MapData, or std_msgs/UInt8MultiArray fallback
+- v2i/spat/raw  -> v2i_spat_msgs/SpatPacket, or std_msgs/UInt8MultiArray fallback
 
 Run via: `ros2 run v2i_rsu_monitor rsu_monitor`
 """
@@ -14,18 +14,26 @@ Run via: `ros2 run v2i_rsu_monitor rsu_monitor`
 import sys
 import math
 import os
+import re
 import time
 import threading
 import queue
+import zipfile
 from datetime import datetime
+import xml.etree.ElementTree as ET
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy
+from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
 from std_msgs.msg import UInt8MultiArray
 
 from pycmssdk.asn1 import Asn1Type, asn1_decode
 from PyQt5 import QtWidgets, QtCore, QtGui, QtNetwork
+
+try:
+    from v2i_map_msgs.msg import MapData
+except ImportError:
+    MapData = None
 
 try:
     from v2i_sdsm_msgs.msg import SDSM
@@ -76,6 +84,16 @@ SDSM_OFFSET_YAW_DEG_BY_SENDER = {}
 
 PIXELS_PER_METER = 4.0
 DOT_RADIUS_PX = 5
+VEHICLE_DOT_RADIUS_PX = 8
+VRU_DOT_RADIUS_PX = 8
+BIKE_DOT_RADIUS_PX = 7
+OBJECT_OUTLINE_WIDTH_PX = 2
+SIGNAL_MARKER_OPACITY = 0.60
+SIGNAL_BOX_WIDTH_PX = 16
+SIGNAL_BOX_HEIGHT_PX = 34
+SIGNAL_COLLISION_PAD_M = 1.25
+SIGNAL_COLLISION_STEP_M = 4.5
+SIGNAL_COLLISION_MAX_RING = 4
 
 SCENE_PAD_M = 30.0
 MAX_SCENE_HALF_SIZE_M = 250.0
@@ -91,6 +109,29 @@ OSM_MAX_TILES = 96
 OSM_USER_AGENT = "v2i_rsu_monitor/0.1 local ROS2 monitor"
 OSM_CACHE_DIR = os.path.expanduser("~/.cache/v2i_rsu_monitor/osm_tiles")
 OSM_TILE_Z_VALUE = -100.0
+SMART_CORRIDOR_KMZ_PATH = "/home/gazi/Downloads/Smart_Corridor.kmz"
+
+SPAT_EVENT_UNKNOWN = 0
+SPAT_EVENT_RED = 1
+SPAT_EVENT_GREEN_PROTECTED = 2
+SPAT_EVENT_YELLOW = 3
+SPAT_EVENT_GREEN_PERMISSIVE = 4
+SPAT_WRAP_WINDOW_DECISECONDS = 600.0
+SPAT_SIGNAL_MARKER_SPACING_M = 38.0
+
+SPAT_INTERSECTION_REF_RAW_BY_ID = {
+    40386: (350415343, -852968100),
+    14867: (350423100, -852988040),
+    12753: (350452439, -853069150),
+    19846: (350457770, -853082840),
+    22762: (350457710, -853094200),
+    52349: (350460760, -853126630),
+}
+
+SPAT_INTERSECTION_ENU_BY_ID = {
+    51560: (-200.384, -2.263),
+    51572: (-306.657, -3.128),
+}
 
 
 # -------------------------
@@ -192,6 +233,64 @@ def normalize_name(name_val):
     return s if s else None
 
 
+def load_kmz_signal_group_movements(kmz_path):
+    if not kmz_path or not os.path.exists(kmz_path):
+        return {}
+
+    ns = {"k": "http://www.opengis.net/kml/2.2"}
+    ref_re = re.compile(r"^(?P<name>.+?) Reference Point ID (?P<id>\d+)$")
+    conn_re = re.compile(
+        r"^(?P<name>.+?) Lane (?P<src>\d+) to Lane (?P<dst>\d+) SG (?P<sg>-?\d+)$"
+    )
+
+    try:
+        with zipfile.ZipFile(kmz_path) as kmz:
+            kml_text = kmz.read("doc.kml")
+        root = ET.fromstring(kml_text)
+    except Exception:
+        return {}
+
+    name_to_id = {}
+    pending_connections = []
+    for placemark in root.findall(".//k:Placemark", ns):
+        name_el = placemark.find("k:name", ns)
+        name = (name_el.text or "").strip() if name_el is not None else ""
+        if not name:
+            continue
+
+        ref_match = ref_re.match(name)
+        if ref_match:
+            name_to_id[ref_match.group("name")] = int(ref_match.group("id"))
+            continue
+
+        conn_match = conn_re.match(name)
+        if conn_match:
+            pending_connections.append({
+                "intersection_name": conn_match.group("name"),
+                "src": int(conn_match.group("src")),
+                "dst": int(conn_match.group("dst")),
+                "sg": int(conn_match.group("sg")),
+            })
+
+    movements = {}
+    seen = set()
+    for conn in pending_connections:
+        intersection_id = name_to_id.get(conn["intersection_name"])
+        if intersection_id is None:
+            continue
+
+        key = (intersection_id, conn["sg"], conn["src"], conn["dst"])
+        if key in seen:
+            continue
+        seen.add(key)
+
+        movements.setdefault(intersection_id, {}).setdefault(conn["sg"], []).append(
+            (conn["src"], conn["dst"])
+        )
+
+    return movements
+
+
 def decode_us_message_frame(payload_bytes):
     return asn1_decode(payload_bytes, Asn1Type.US_MESSAGE_FRAME)
 
@@ -266,6 +365,89 @@ def expand_bbox(bbox, pad_m):
     return (minx - pad_m, miny - pad_m, maxx + pad_m, maxy + pad_m)
 
 
+def point_distance_sq(a, b):
+    dx = a[0] - b[0]
+    dy = a[1] - b[1]
+    return dx * dx + dy * dy
+
+
+def signal_state_name(event_state):
+    if event_state == SPAT_EVENT_RED:
+        return "Red"
+    if event_state == SPAT_EVENT_YELLOW:
+        return "Yellow"
+    if event_state in (SPAT_EVENT_GREEN_PROTECTED, SPAT_EVENT_GREEN_PERMISSIVE):
+        return "Green"
+    return "Unknown"
+
+
+def signal_state_color(event_state):
+    if event_state == SPAT_EVENT_RED:
+        return QtGui.QColor(229, 57, 53)
+    if event_state == SPAT_EVENT_YELLOW:
+        return QtGui.QColor(253, 216, 53)
+    if event_state in (SPAT_EVENT_GREEN_PROTECTED, SPAT_EVENT_GREEN_PERMISSIVE):
+        return QtGui.QColor(67, 160, 71)
+    return QtGui.QColor(144, 164, 174)
+
+
+def countdown_text(remaining_seconds):
+    if not isinstance(remaining_seconds, (int, float)):
+        return "--"
+    return f"{max(0.0, int(remaining_seconds * 10.0) / 10.0):.1f}s"
+
+
+def spat_current_deciseconds(moy, timestamp_ms):
+    if not isinstance(moy, int) or not isinstance(timestamp_ms, int):
+        return None
+    minute_in_hour = moy % 60
+    second_in_minute = float(timestamp_ms) / 1000.0
+    return (minute_in_hour * 60.0 + second_in_minute) * 10.0
+
+
+def normalize_spat_delta_deciseconds(delta_deciseconds):
+    if delta_deciseconds < 0.0:
+        return delta_deciseconds + SPAT_WRAP_WINDOW_DECISECONDS
+    return delta_deciseconds
+
+
+def choose_spat_end_deciseconds(min_end, max_end, current_deciseconds):
+    has_min = isinstance(min_end, int)
+    has_max = isinstance(max_end, int)
+    if not has_min and not has_max:
+        return None
+    if current_deciseconds is None:
+        return min_end if has_min else max_end
+    if not has_min:
+        return max_end
+    if not has_max:
+        return min_end
+
+    raw_d_min = (float(min_end) - current_deciseconds) / 10.0
+    raw_d_max = (float(max_end) - current_deciseconds) / 10.0
+    d_max = normalize_spat_delta_deciseconds(float(max_end) - current_deciseconds) / 10.0
+
+    min_is_effectively_now = -1.0 <= raw_d_min <= 1.0
+    max_is_reasonable_future = 1.0 < d_max <= 120.0
+    max_is_not_effectively_now = raw_d_max > 1.0
+    if min_is_effectively_now and max_is_reasonable_future and max_is_not_effectively_now:
+        return max_end
+
+    return min_end
+
+
+def spat_remaining_seconds(moy, timestamp_ms, min_end, max_end):
+    current_deciseconds = spat_current_deciseconds(moy, timestamp_ms)
+    end_deciseconds = choose_spat_end_deciseconds(min_end, max_end, current_deciseconds)
+    if current_deciseconds is None or end_deciseconds is None:
+        return None
+
+    remaining_deciseconds = normalize_spat_delta_deciseconds(
+        float(end_deciseconds) - current_deciseconds
+    )
+    return max(0.0, remaining_deciseconds / 10.0)
+
+
 # -------------------------
 # Extractors (copied)
 # -------------------------
@@ -323,7 +505,7 @@ def extract_map_intersections(decoded):
 
 
 def extract_spat_states(decoded):
-    out = {"intersection_id": None, "states": []}
+    out = {"intersection_id": None, "moy": None, "timeStamp": None, "states": []}
 
     _, inters_val = find_first_key_recursive(decoded, ["intersections"])
     if isinstance(inters_val, (list, tuple)) and len(inters_val) > 0:
@@ -343,6 +525,19 @@ def extract_spat_states(decoded):
                 iid = iid_val["id"]
 
         out["intersection_id"] = iid
+
+        moy = first.get("moy") if isinstance(first, dict) else None
+        if not isinstance(moy, int):
+            _, moy_val = find_first_key_recursive(first, ["moy", "minuteOfYear"])
+            moy = moy_val if isinstance(moy_val, int) else None
+
+        timestamp = first.get("timeStamp") if isinstance(first, dict) else None
+        if not isinstance(timestamp, int):
+            _, timestamp_val = find_first_key_recursive(first, ["timeStamp", "timestamp"])
+            timestamp = timestamp_val if isinstance(timestamp_val, int) else None
+
+        out["moy"] = moy
+        out["timeStamp"] = timestamp
 
         states_val = first.get("states") if isinstance(first, dict) else None
         if states_val is None:
@@ -375,8 +570,10 @@ def extract_spat_states(decoded):
                 out["states"].append({
                     "signalGroup": sg,
                     "eventState": event,
+                    "eventName": signal_state_name(event),
                     "minEndTime": min_end,
                     "maxEndTime": max_end,
+                    "remainingSeconds": spat_remaining_seconds(moy, timestamp, min_end, max_end),
                 })
 
     return out
@@ -527,7 +724,60 @@ def spat_ros_msg_to_decoded(msg):
 
         intersections.append({
             "id": {"id": int(getattr(inter, "intersection_id", 0))},
+            "moy": int(getattr(inter, "moy", 0)),
+            "timeStamp": int(getattr(inter, "time_stamp", 0)),
             "states": states,
+        })
+
+    return {"intersections": intersections}
+
+
+def map_ros_msg_to_decoded(msg):
+    intersections = []
+
+    for inter in getattr(msg, "intersections", []):
+        lanes = []
+
+        for lane in getattr(inter, "lane_set", []):
+            node_entries = []
+            connection_entries = []
+
+            for node in getattr(lane, "nodes", []):
+                node_entries.append({
+                    "delta": (
+                        getattr(node, "node_type", ""),
+                        {
+                            "x": int(getattr(node, "x", 0)),
+                            "y": int(getattr(node, "y", 0)),
+                        },
+                    )
+                })
+
+            for conn in getattr(lane, "connections", []):
+                connection_entries.append({
+                    "connectingLane": {
+                        "lane": int(getattr(conn, "connecting_lane", 0)),
+                    },
+                    "signalGroup": int(getattr(conn, "signal_group", 0)),
+                })
+
+            lanes.append({
+                "laneID": int(getattr(lane, "lane_id", 0)),
+                "nodeList": ("nodes", node_entries),
+                "connectsTo": connection_entries,
+            })
+
+        ref_point = getattr(inter, "ref_point", None)
+        intersection_id = getattr(inter, "id", None)
+
+        intersections.append({
+            "name": normalize_name(getattr(inter, "name", "")),
+            "id": {"id": int(getattr(intersection_id, "id", 0))},
+            "refPoint": {
+                "lat": int(getattr(ref_point, "lat", 0)),
+                "long": int(getattr(ref_point, "lon", 0)),
+            },
+            "laneSet": lanes,
         })
 
     return {"intersections": intersections}
@@ -587,6 +837,101 @@ def build_lane_polylines_from_laneSet(laneSet):
     return polylines
 
 
+def _connection_entries(value):
+    if isinstance(value, tuple) and len(value) == 2:
+        value = value[1]
+
+    if isinstance(value, dict):
+        for key in ("connectsTo", "connections", "ConnectionList", "connectionList"):
+            maybe = value.get(key)
+            if isinstance(maybe, (list, tuple)):
+                value = maybe
+                break
+
+    return value if isinstance(value, (list, tuple)) else []
+
+
+def _connection_signal_group(conn):
+    if isinstance(conn, tuple) and len(conn) == 2:
+        conn = conn[1]
+    if not isinstance(conn, dict):
+        return None
+
+    for key in ("signalGroup", "signal_group"):
+        val = conn.get(key)
+        if isinstance(val, int):
+            return val
+
+    _, val = find_first_key_recursive(conn, ["signalGroup", "signal_group"])
+    return val if isinstance(val, int) else None
+
+
+def _connection_destination_lane(conn):
+    if isinstance(conn, tuple) and len(conn) == 2:
+        conn = conn[1]
+    if not isinstance(conn, dict):
+        return None
+
+    val = conn.get("connecting_lane")
+    if isinstance(val, int):
+        return val
+
+    val = conn.get("connectingLane")
+    if isinstance(val, tuple) and len(val) == 2:
+        val = val[1]
+    if isinstance(val, int):
+        return val
+    if isinstance(val, dict):
+        for key in ("lane", "laneID", "laneId", "connecting_lane"):
+            lane_val = val.get(key)
+            if isinstance(lane_val, int):
+                return lane_val
+
+    _, lane_val = find_first_key_recursive(conn, ["connectingLane", "connecting_lane"])
+    if isinstance(lane_val, int):
+        return lane_val
+    if isinstance(lane_val, dict):
+        for key in ("lane", "laneID", "laneId"):
+            val = lane_val.get(key)
+            if isinstance(val, int):
+                return val
+
+    return None
+
+
+def extract_map_signal_group_movements(laneSet):
+    movements = {}
+    seen = set()
+    if not isinstance(laneSet, (list, tuple)):
+        return movements
+
+    for lane in laneSet:
+        if not isinstance(lane, dict):
+            continue
+
+        src_lane = lane.get("laneID")
+        if not isinstance(src_lane, int):
+            continue
+
+        connections = lane.get("connectsTo")
+        if connections is None:
+            connections = lane.get("connections")
+
+        for conn in _connection_entries(connections):
+            signal_group = _connection_signal_group(conn)
+            dst_lane = _connection_destination_lane(conn)
+            if not isinstance(signal_group, int) or not isinstance(dst_lane, int):
+                continue
+
+            key = (signal_group, src_lane, dst_lane)
+            if key in seen:
+                continue
+            seen.add(key)
+            movements.setdefault(signal_group, []).append((src_lane, dst_lane))
+
+    return movements
+
+
 def convert_map_polylines_to_global(ref_lat_deg, ref_lon_deg, lane_polylines_local):
     if ref_lat_deg is None or ref_lon_deg is None:
         return {}
@@ -613,6 +958,11 @@ class RosBridge(Node):
         self.msg_q = msg_q
         self.stop_evt = stop_evt
         raw_topic_qos = QoSProfile(depth=10, reliability=QoSReliabilityPolicy.BEST_EFFORT)
+        map_topic_qos = QoSProfile(
+            depth=1,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        )
 
         if SDSM is not None:
             self.sub_sdsm = self.create_subscription(
@@ -633,12 +983,24 @@ class RosBridge(Node):
                 "v2i_sdsm_msgs is not available; subscribing to v2i/sdsm/raw as UInt8MultiArray"
             )
 
-        self.sub_map = self.create_subscription(
-            UInt8MultiArray,
-            "v2i/map/raw",
-            lambda msg: self._cb_uint8(msg, "MAP", "v2i/map/raw"),
-            raw_topic_qos,
-        )
+        if MapData is not None:
+            self.sub_map = self.create_subscription(
+                MapData,
+                "v2i/map/raw",
+                lambda msg: self._cb_map_msg(msg, "v2i/map/raw"),
+                map_topic_qos,
+            )
+            self.get_logger().info("Subscribed to v2i/map/raw as v2i_map_msgs/msg/MapData")
+        else:
+            self.sub_map = self.create_subscription(
+                UInt8MultiArray,
+                "v2i/map/raw",
+                lambda msg: self._cb_uint8(msg, "MAP", "v2i/map/raw"),
+                raw_topic_qos,
+            )
+            self.get_logger().warn(
+                "v2i_map_msgs is not available; subscribing to v2i/map/raw as UInt8MultiArray"
+            )
 
         if SpatPacket is not None:
             self.sub_spat = self.create_subscription(
@@ -691,6 +1053,14 @@ class RosBridge(Node):
             return
         self._queue_decoded("SDSM", topic, decoded)
 
+    def _cb_map_msg(self, msg, topic):
+        try:
+            decoded = map_ros_msg_to_decoded(msg)
+        except Exception as exc:
+            self.get_logger().warn(f"Failed to convert MAP message: {exc}")
+            return
+        self._queue_decoded("MAP", topic, decoded)
+
     def _cb_spat_msg(self, msg, topic):
         try:
             decoded = spat_ros_msg_to_decoded(msg)
@@ -710,6 +1080,98 @@ class RosBridge(Node):
 # is included verbatim.)
 
 # --- VirtualMapView and MainWindow implementations ---
+class TrafficLightWidget(QtWidgets.QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumWidth(118)
+        self.setMaximumWidth(150)
+        self.setStyleSheet(
+            "QFrame { background-color: #0f172a; border: 1px solid #334155; border-radius: 8px; }"
+        )
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(5)
+
+        self.title = QtWidgets.QLabel("--")
+        self.title.setAlignment(QtCore.Qt.AlignCenter)
+        self.title.setStyleSheet("color: #e5e7eb; font-weight: 700; border: 0;")
+        layout.addWidget(self.title)
+
+        self.lamp_box = QtWidgets.QFrame()
+        self.lamp_box.setStyleSheet(
+            "QFrame { background-color: #020617; border: 1px solid #1e293b; border-radius: 8px; }"
+        )
+        lamp_layout = QtWidgets.QVBoxLayout(self.lamp_box)
+        lamp_layout.setContentsMargins(8, 8, 8, 8)
+        lamp_layout.setSpacing(5)
+
+        self.red_lamp = self._create_lamp()
+        self.yellow_lamp = self._create_lamp()
+        self.green_lamp = self._create_lamp()
+        lamp_layout.addWidget(self.red_lamp, alignment=QtCore.Qt.AlignCenter)
+        lamp_layout.addWidget(self.yellow_lamp, alignment=QtCore.Qt.AlignCenter)
+        lamp_layout.addWidget(self.green_lamp, alignment=QtCore.Qt.AlignCenter)
+        layout.addWidget(self.lamp_box, alignment=QtCore.Qt.AlignCenter)
+
+        self.countdown = QtWidgets.QLabel("--")
+        self.countdown.setAlignment(QtCore.Qt.AlignCenter)
+        self.countdown.setStyleSheet("color: #f8fafc; font-size: 15px; font-weight: 700; border: 0;")
+        layout.addWidget(self.countdown)
+
+        self.state_label = QtWidgets.QLabel("Unknown")
+        self.state_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.state_label.setStyleSheet("color: #cbd5e1; border: 0;")
+        layout.addWidget(self.state_label)
+
+        self.movements_label = QtWidgets.QLabel("")
+        self.movements_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.movements_label.setWordWrap(True)
+        self.movements_label.setStyleSheet("color: #94a3b8; font-size: 11px; border: 0;")
+        layout.addWidget(self.movements_label)
+
+        self.update_state(None, None, None, None, "")
+
+    def _create_lamp(self):
+        lamp = QtWidgets.QLabel()
+        lamp.setFixedSize(32, 32)
+        lamp.setStyleSheet(self._lamp_style(QtGui.QColor(38, 50, 56)))
+        return lamp
+
+    def _lamp_style(self, color):
+        return (
+            "border-radius: 16px; "
+            f"background-color: rgb({color.red()}, {color.green()}, {color.blue()}); "
+            "border: 1px solid #111827;"
+        )
+
+    def update_state(
+        self, intersection_id, signal_group, event_state, remaining_seconds,
+        movements_text="", source_lane=None
+    ):
+        title = "--" if intersection_id is None else f"I{intersection_id} SG{signal_group}"
+        if source_lane is not None:
+            title = f"{title} L{source_lane}"
+        self.title.setText(title)
+
+        off = QtGui.QColor(38, 50, 56)
+        self.red_lamp.setStyleSheet(self._lamp_style(off))
+        self.yellow_lamp.setStyleSheet(self._lamp_style(off))
+        self.green_lamp.setStyleSheet(self._lamp_style(off))
+
+        if event_state == SPAT_EVENT_RED:
+            self.red_lamp.setStyleSheet(self._lamp_style(signal_state_color(event_state)))
+        elif event_state == SPAT_EVENT_YELLOW:
+            self.yellow_lamp.setStyleSheet(self._lamp_style(signal_state_color(event_state)))
+        elif event_state in (SPAT_EVENT_GREEN_PROTECTED, SPAT_EVENT_GREEN_PERMISSIVE):
+            self.green_lamp.setStyleSheet(self._lamp_style(signal_state_color(event_state)))
+
+        self.countdown.setText(countdown_text(remaining_seconds))
+        self.state_label.setText(signal_state_name(event_state))
+        self.movements_label.setText(movements_text)
+        self.setToolTip(movements_text)
+
+
 class VirtualMapView(QtWidgets.QGraphicsView):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -726,6 +1188,7 @@ class VirtualMapView(QtWidgets.QGraphicsView):
         self._lane_label_items = []
         self._dot_items = []
         self._dot_label_items = []
+        self._signal_items = []
         self._tile_items = {}
         self._pending_tiles = set()
         self._wanted_tiles = set()
@@ -931,6 +1394,7 @@ class VirtualMapView(QtWidgets.QGraphicsView):
         self._lane_label_items.clear()
         self._dot_items.clear()
         self._dot_label_items.clear()
+        self._signal_items.clear()
         self._tile_items.clear()
         self._wanted_tiles.clear()
 
@@ -950,15 +1414,10 @@ class VirtualMapView(QtWidgets.QGraphicsView):
         self._static_items.append(self.scene.addLine(-half_px, 0, half_px, 0, axis_pen))
         self._static_items.append(self.scene.addLine(0, -half_px, 0, half_px, axis_pen))
 
-        t = self.scene.addText(f"Fixed origin = {TARGET_ORIGIN_NAME} (0,0)")
-        t.setDefaultTextColor(QtGui.QColor(120, 120, 120))
-        t.setPos(10, 10)
-        self._static_items.append(t)
-
         self._draw_north_east_markers()
         self.fitInView(self.scene.sceneRect(), QtCore.Qt.KeepAspectRatio)
 
-    def _draw_arrow(self, x0, y0, x1, y1, color, label):
+    def _draw_arrow(self, x0, y0, x1, y1, color, _label):
         pen = QtGui.QPen(color)
         pen.setWidth(2)
         self._static_items.append(self.scene.addLine(x0, y0, x1, y1, pen))
@@ -977,11 +1436,6 @@ class VirtualMapView(QtWidgets.QGraphicsView):
         self._static_items.append(self.scene.addLine(x1, y1, xh1, yh1, pen))
         self._static_items.append(self.scene.addLine(x1, y1, xh2, yh2, pen))
 
-        txt = self.scene.addText(label)
-        txt.setDefaultTextColor(color)
-        txt.setPos(x1 + 6, y1 + 6)
-        self._static_items.append(txt)
-
     def _draw_north_east_markers(self):
         origin_x, origin_y = 0, 0
         L = 90
@@ -990,19 +1444,33 @@ class VirtualMapView(QtWidgets.QGraphicsView):
 
     def _color_for_class(self, cls):
         c = (cls or "unknown").lower()
-        if "ped" in c:
-            return QtGui.QColor(0, 200, 255)
+        if "ped" in c or "vru" in c:
+            return QtGui.QColor(236, 72, 153)
         if "bicy" in c or "bike" in c:
-            return QtGui.QColor(255, 200, 0)
+            return QtGui.QColor(124, 58, 237)
         if "car" in c or "veh" in c:
-            return QtGui.QColor(0, 220, 0)
-        return QtGui.QColor(255, 0, 255)
+            return QtGui.QColor(37, 99, 235)
+        return QtGui.QColor(249, 115, 22)
 
-    def draw_world(self, all_lane_records, all_object_records):
+    def _radius_for_class(self, cls):
+        c = (cls or "unknown").lower()
+        if "ped" in c or "vru" in c:
+            return VRU_DOT_RADIUS_PX
+        if "bicy" in c or "bike" in c:
+            return BIKE_DOT_RADIUS_PX
+        if "car" in c or "veh" in c:
+            return VEHICLE_DOT_RADIUS_PX
+        return DOT_RADIUS_PX
+
+    def draw_world(self, all_lane_records, all_object_records, all_signal_records=None):
+        if all_signal_records is None:
+            all_signal_records = []
+
         self._clear_items(self._lane_items)
         self._clear_items(self._lane_label_items)
         self._clear_items(self._dot_items)
         self._clear_items(self._dot_label_items)
+        self._clear_items(self._signal_items)
 
         minx = 1e9
         miny = 1e9
@@ -1014,8 +1482,6 @@ class VirtualMapView(QtWidgets.QGraphicsView):
 
         for rec in all_lane_records:
             pts = rec.get("points_global", [])
-            lane_id = rec.get("lane_id")
-            iid = rec.get("intersection_id")
 
             if not pts or len(pts) < 2:
                 continue
@@ -1028,11 +1494,6 @@ class VirtualMapView(QtWidgets.QGraphicsView):
                 path.lineTo(xm * PIXELS_PER_METER, -ym * PIXELS_PER_METER)
 
             self._lane_items.append(self.scene.addPath(path, lane_pen))
-
-            txt = self.scene.addText(f"{iid}:{lane_id}")
-            txt.setDefaultTextColor(QtGui.QColor(80, 80, 80))
-            txt.setPos(x0 * PIXELS_PER_METER + 5, -y0 * PIXELS_PER_METER + 5)
-            self._lane_label_items.append(txt)
 
             for xm, ym in pts:
                 minx = min(minx, xm)
@@ -1051,27 +1512,104 @@ class VirtualMapView(QtWidgets.QGraphicsView):
 
             color = self._color_for_class(ob.get("class"))
             brush = QtGui.QBrush(color)
-            pen = QtGui.QPen(QtCore.Qt.NoPen)
+            radius_px = self._radius_for_class(ob.get("class"))
+            pen = QtGui.QPen(QtGui.QColor(255, 255, 255, 235))
+            pen.setWidth(OBJECT_OUTLINE_WIDTH_PX)
 
             self._dot_items.append(
                 self.scene.addEllipse(
-                    px - DOT_RADIUS_PX, py - DOT_RADIUS_PX,
-                    2 * DOT_RADIUS_PX, 2 * DOT_RADIUS_PX,
+                    px - radius_px, py - radius_px,
+                    2 * radius_px, 2 * radius_px,
                     pen, brush
                 )
             )
-
-            label = ob.get("id")
-            if label is not None:
-                t = self.scene.addText(str(label))
-                t.setDefaultTextColor(QtGui.QColor(60, 60, 60))
-                t.setPos(px + 6, py + 6)
-                self._dot_label_items.append(t)
 
             minx = min(minx, xm)
             miny = min(miny, ym)
             maxx = max(maxx, xm)
             maxy = max(maxy, ym)
+
+        for sig in all_signal_records:
+            xm = sig.get("x_m")
+            ym = sig.get("y_m")
+            if not isinstance(xm, (int, float)) or not isinstance(ym, (int, float)):
+                continue
+
+            anchor_xm = sig.get("anchor_x_m", xm)
+            anchor_ym = sig.get("anchor_y_m", ym)
+            if not isinstance(anchor_xm, (int, float)) or not isinstance(anchor_ym, (int, float)):
+                anchor_xm = xm
+                anchor_ym = ym
+
+            px = xm * PIXELS_PER_METER
+            py = -ym * PIXELS_PER_METER
+            anchor_px = anchor_xm * PIXELS_PER_METER
+            anchor_py = -anchor_ym * PIXELS_PER_METER
+            event_state = sig.get("eventState")
+            color = signal_state_color(event_state)
+            dark = QtGui.QColor(20, 24, 31)
+            off = QtGui.QColor(60, 70, 80)
+            pen = QtGui.QPen(QtGui.QColor(15, 23, 42))
+            pen.setWidth(1)
+
+            if point_distance_sq((xm, ym), (anchor_xm, anchor_ym)) > 0.25:
+                leader_pen = QtGui.QPen(QtGui.QColor(31, 41, 55, 190))
+                leader_pen.setWidth(1)
+                leader_item = self.scene.addLine(anchor_px, anchor_py, px, py, leader_pen)
+                leader_item.setOpacity(SIGNAL_MARKER_OPACITY)
+                self._signal_items.append(leader_item)
+
+            box_w = SIGNAL_BOX_WIDTH_PX
+            box_h = SIGNAL_BOX_HEIGHT_PX
+            body_item = self.scene.addRect(
+                px - box_w / 2, py - box_h / 2, box_w, box_h, pen, QtGui.QBrush(dark)
+            )
+            body_item.setOpacity(SIGNAL_MARKER_OPACITY)
+            self._signal_items.append(body_item)
+
+            lamp_radius = 4
+            lamps = [
+                (SPAT_EVENT_RED, py - 10),
+                (SPAT_EVENT_YELLOW, py),
+                (SPAT_EVENT_GREEN_PROTECTED, py + 10),
+            ]
+            for state_id, cy in lamps:
+                active = (
+                    event_state == state_id
+                    or (
+                        state_id == SPAT_EVENT_GREEN_PROTECTED
+                        and event_state == SPAT_EVENT_GREEN_PERMISSIVE
+                    )
+                )
+                brush_color = color if active else off
+                lamp_item = self.scene.addEllipse(
+                    px - lamp_radius,
+                    cy - lamp_radius,
+                    lamp_radius * 2,
+                    lamp_radius * 2,
+                    QtGui.QPen(QtCore.Qt.NoPen),
+                    QtGui.QBrush(brush_color),
+                )
+                lamp_item.setOpacity(SIGNAL_MARKER_OPACITY)
+                self._signal_items.append(lamp_item)
+
+            countdown = countdown_text(sig.get("remainingSeconds"))
+            if countdown != "--":
+                text_item = self.scene.addText(countdown)
+                text_item.setDefaultTextColor(QtGui.QColor(15, 23, 42))
+                font = text_item.font()
+                font.setPointSize(8)
+                font.setBold(True)
+                text_item.setFont(font)
+                text_item.setFlag(QtWidgets.QGraphicsItem.ItemIgnoresTransformations, True)
+                text_item.setPos(px + 10, py - 10)
+                text_item.setToolTip(sig.get("movementsText", ""))
+                self._signal_items.append(text_item)
+
+            minx = min(minx, xm, anchor_xm)
+            miny = min(miny, ym, anchor_ym)
+            maxx = max(maxx, xm, anchor_xm)
+            maxy = max(maxy, ym, anchor_ym)
 
         if minx < 1e8:
             pad = SCENE_PAD_M
@@ -1098,6 +1636,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.map_store = {}
         self.spat_store = {}
         self.sdsm_store = {}
+        self.signal_widgets = {}
+        self.kmz_signal_movements = load_kmz_signal_group_movements(SMART_CORRIDOR_KMZ_PATH)
 
         self.ui_frozen = False
         self.did_auto_fit_objects = False
@@ -1155,14 +1695,34 @@ class MainWindow(QtWidgets.QMainWindow):
 
         spat_box = QtWidgets.QGroupBox("SPaT (all intersections)")
         spat_layout = QtWidgets.QVBoxLayout(spat_box)
-        self.tbl_spat = QtWidgets.QTableWidget(0, 5)
+
+        self.signal_scroll = QtWidgets.QScrollArea()
+        self.signal_scroll.setWidgetResizable(True)
+        self.signal_scroll.setMinimumHeight(260)
+        self.signal_container = QtWidgets.QWidget()
+        self.signal_grid = QtWidgets.QGridLayout(self.signal_container)
+        self.signal_grid.setContentsMargins(4, 4, 4, 4)
+        self.signal_grid.setHorizontalSpacing(8)
+        self.signal_grid.setVerticalSpacing(8)
+        self.signal_scroll.setWidget(self.signal_container)
+        spat_layout.addWidget(self.signal_scroll, stretch=2)
+
+        self.tbl_spat = QtWidgets.QTableWidget(0, 7)
         self.tbl_spat.setHorizontalHeaderLabels(
-            ["IntersectionID", "SignalGroup", "EventState", "MinEndTime", "MaxEndTime"]
+            [
+                "IntersectionID",
+                "SignalGroup",
+                "Movements",
+                "State",
+                "Countdown",
+                "MinEndTime",
+                "MaxEndTime",
+            ]
         )
         self.tbl_spat.horizontalHeader().setStretchLastSection(True)
         self.tbl_spat.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        spat_layout.addWidget(self.tbl_spat)
-        right.addWidget(spat_box, stretch=1)
+        spat_layout.addWidget(self.tbl_spat, stretch=1)
+        right.addWidget(spat_box, stretch=2)
 
         sdsm_box = QtWidgets.QGroupBox("SDSM Objects (all sources)")
         sdsm_layout = QtWidgets.QVBoxLayout(sdsm_box)
@@ -1244,6 +1804,232 @@ class MainWindow(QtWidgets.QMainWindow):
                 })
         return out
 
+    def _spat_anchor_meters(self, intersection_id):
+        ms = self.map_store.get(intersection_id)
+        if ms:
+            pts = []
+            for _, poly in ms.get("lane_polylines_global", {}).items():
+                pts.extend(poly)
+            bbox = compute_bbox_from_points(pts)
+            if bbox is not None:
+                minx, miny, maxx, maxy = bbox
+                return (minx + maxx) * 0.5, (miny + maxy) * 0.5
+
+        ref_raw = SPAT_INTERSECTION_REF_RAW_BY_ID.get(intersection_id)
+        if ref_raw is not None:
+            lat_deg, lon_deg = latlon_raw_to_deg(ref_raw[0], ref_raw[1])
+            return enu_from_latlon_deg(TARGET_ORIGIN_LAT, TARGET_ORIGIN_LON, lat_deg, lon_deg)
+
+        enu = SPAT_INTERSECTION_ENU_BY_ID.get(intersection_id)
+        if enu is not None:
+            return enu
+
+        known_ids = sorted(self.spat_store.keys())
+        try:
+            idx = known_ids.index(intersection_id)
+        except ValueError:
+            idx = 0
+        return (
+            idx * SPAT_SIGNAL_MARKER_SPACING_M,
+            -SPAT_SIGNAL_MARKER_SPACING_M,
+        )
+
+    def _remaining_for_spat_state(self, state, rec):
+        remaining = state.get("remainingSeconds")
+        if not isinstance(remaining, (int, float)):
+            return None
+
+        last_update = rec.get("last_update_monotonic")
+        if not isinstance(last_update, (int, float)):
+            return max(0.0, remaining)
+
+        return max(0.0, remaining - (time.monotonic() - last_update))
+
+    def _movements_for_signal_group(self, intersection_id, signal_group):
+        ms = self.map_store.get(intersection_id)
+        if ms:
+            movements = ms.get("signal_group_movements", {}).get(signal_group, [])
+            if movements:
+                return movements
+
+        return self.kmz_signal_movements.get(intersection_id, {}).get(signal_group, [])
+
+    def _movement_text_for_signal_group(self, intersection_id, signal_group):
+        movements = self._movements_for_signal_group(intersection_id, signal_group)
+        if not movements:
+            return ""
+        return ", ".join(f"L{src}->L{dst}" for src, dst in movements)
+
+    def _source_lane_endpoint_for_movement(self, intersection_id, src_lane, dst_lanes):
+        ms = self.map_store.get(intersection_id)
+        if not ms:
+            return None
+
+        lane_polylines = ms.get("lane_polylines_global", {})
+        src_poly = lane_polylines.get(src_lane)
+        if not src_poly:
+            return None
+
+        src_endpoints = [src_poly[0]]
+        if src_poly[-1] != src_poly[0]:
+            src_endpoints.append(src_poly[-1])
+
+        dst_endpoints = []
+        for dst_lane in dst_lanes:
+            if dst_lane == src_lane:
+                continue
+            dst_poly = lane_polylines.get(dst_lane)
+            if not dst_poly:
+                continue
+            dst_endpoints.append(dst_poly[0])
+            if dst_poly[-1] != dst_poly[0]:
+                dst_endpoints.append(dst_poly[-1])
+
+        if dst_endpoints:
+            return min(
+                src_endpoints,
+                key=lambda point: min(point_distance_sq(point, other) for other in dst_endpoints),
+            )
+
+        anchor = self._spat_anchor_meters(intersection_id)
+        return min(src_endpoints, key=lambda point: point_distance_sq(point, anchor))
+
+    def _signal_marker_placements_for_group(self, intersection_id, signal_group):
+        movements = self._movements_for_signal_group(intersection_id, signal_group)
+        by_source_lane = {}
+        for src_lane, dst_lane in movements:
+            if not isinstance(src_lane, int) or not isinstance(dst_lane, int):
+                continue
+            by_source_lane.setdefault(src_lane, []).append(dst_lane)
+
+        placements = []
+        for src_lane, dst_lanes in sorted(by_source_lane.items()):
+            dst_lanes = sorted(set(dst_lanes))
+            point = self._source_lane_endpoint_for_movement(
+                intersection_id, src_lane, dst_lanes
+            )
+            if point is None:
+                continue
+
+            movements_text = ", ".join(f"L{src_lane}->L{dst}" for dst in dst_lanes)
+            placements.append({
+                "x_m": point[0],
+                "y_m": point[1],
+                "sourceLane": src_lane,
+                "destinationLanes": dst_lanes,
+                "movementsText": movements_text,
+                "placementKey": f"L{src_lane}",
+            })
+
+        if placements:
+            return placements
+
+        anchor_x, anchor_y = self._spat_anchor_meters(intersection_id)
+        return [{
+            "x_m": anchor_x,
+            "y_m": anchor_y,
+            "sourceLane": None,
+            "destinationLanes": [],
+            "movementsText": self._movement_text_for_signal_group(
+                intersection_id, signal_group
+            ),
+            "placementKey": "anchor",
+        }]
+
+    def _signal_marker_bbox(self, x_m, y_m):
+        width_m = SIGNAL_BOX_WIDTH_PX / PIXELS_PER_METER + 2.0 * SIGNAL_COLLISION_PAD_M
+        height_m = SIGNAL_BOX_HEIGHT_PX / PIXELS_PER_METER + 2.0 * SIGNAL_COLLISION_PAD_M
+        return (
+            x_m - width_m / 2.0,
+            y_m - height_m / 2.0,
+            x_m + width_m / 2.0,
+            y_m + height_m / 2.0,
+        )
+
+    def _signal_bboxes_overlap(self, a, b):
+        return not (a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1])
+
+    def _signal_offset_candidates(self):
+        yield 0.0, 0.0
+        directions = [
+            (1.0, 0.0),
+            (-1.0, 0.0),
+            (0.0, 1.0),
+            (0.0, -1.0),
+            (1.0, 1.0),
+            (1.0, -1.0),
+            (-1.0, 1.0),
+            (-1.0, -1.0),
+        ]
+        for ring in range(1, SIGNAL_COLLISION_MAX_RING + 1):
+            distance = ring * SIGNAL_COLLISION_STEP_M
+            for dx, dy in directions:
+                scale = distance / math.hypot(dx, dy)
+                yield dx * scale, dy * scale
+
+    def _apply_signal_collision_offsets(self, records):
+        placed_bboxes = []
+        adjusted = []
+
+        for rec in records:
+            x_m = rec.get("x_m")
+            y_m = rec.get("y_m")
+            if not isinstance(x_m, (int, float)) or not isinstance(y_m, (int, float)):
+                adjusted.append(rec)
+                continue
+
+            out = dict(rec)
+            out["anchor_x_m"] = x_m
+            out["anchor_y_m"] = y_m
+
+            chosen_x = x_m
+            chosen_y = y_m
+            chosen_bbox = self._signal_marker_bbox(chosen_x, chosen_y)
+            for dx, dy in self._signal_offset_candidates():
+                candidate_x = x_m + dx
+                candidate_y = y_m + dy
+                candidate_bbox = self._signal_marker_bbox(candidate_x, candidate_y)
+                if not any(self._signal_bboxes_overlap(candidate_bbox, other) for other in placed_bboxes):
+                    chosen_x = candidate_x
+                    chosen_y = candidate_y
+                    chosen_bbox = candidate_bbox
+                    break
+
+            out["x_m"] = chosen_x
+            out["y_m"] = chosen_y
+            placed_bboxes.append(chosen_bbox)
+            adjusted.append(out)
+
+        return adjusted
+
+    def _collect_spat_signal_records(self):
+        records = []
+        for iid, rec in sorted(self.spat_store.items(), key=lambda item: str(item[0])):
+            states = rec.get("states", [])
+            states = sorted(states, key=lambda st: str(st.get("signalGroup")))
+
+            for st in states:
+                sg = st.get("signalGroup")
+                event_state = st.get("eventState")
+                for placement in self._signal_marker_placements_for_group(iid, sg):
+                    records.append({
+                        "recordKey": (iid, sg, placement.get("placementKey")),
+                        "intersection_id": iid,
+                        "signalGroup": sg,
+                        "eventState": event_state,
+                        "eventName": signal_state_name(event_state),
+                        "remainingSeconds": self._remaining_for_spat_state(st, rec),
+                        "minEndTime": st.get("minEndTime"),
+                        "maxEndTime": st.get("maxEndTime"),
+                        "movementsText": placement.get("movementsText", ""),
+                        "sourceLane": placement.get("sourceLane"),
+                        "destinationLanes": placement.get("destinationLanes", []),
+                        "x_m": placement.get("x_m"),
+                        "y_m": placement.get("y_m"),
+                    })
+
+        return self._apply_signal_collision_offsets(records)
+
     def _update_intersection_dropdown(self):
         current = self.cmb_intersection.currentData()
         self.cmb_intersection.blockSignals(True)
@@ -1271,23 +2057,57 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update_spat_table(self):
         self.tbl_spat.setRowCount(0)
-        rows = []
-        for iid, rec in self.spat_store.items():
-            for st in rec.get("states", []):
-                rows.append((
-                    iid,
-                    st.get("signalGroup"),
-                    st.get("eventState"),
-                    st.get("minEndTime"),
-                    st.get("maxEndTime"),
-                ))
-
-        rows.sort(key=lambda r: (str(r[0]), str(r[1])))
+        self._update_traffic_light_widgets()
+        rows = [
+            (
+                rec.get("intersection_id"),
+                rec.get("signalGroup"),
+                rec.get("movementsText"),
+                rec.get("eventName"),
+                countdown_text(rec.get("remainingSeconds")),
+                rec.get("minEndTime"),
+                rec.get("maxEndTime"),
+            )
+            for rec in self._collect_spat_signal_records()
+        ]
 
         for r, row in enumerate(rows):
             self.tbl_spat.insertRow(r)
             for c, val in enumerate(row):
                 self.tbl_spat.setItem(r, c, QtWidgets.QTableWidgetItem(str(val)))
+
+    def _update_traffic_light_widgets(self):
+        records = self._collect_spat_signal_records()
+        active_keys = {
+            rec.get("recordKey")
+            for rec in records
+        }
+
+        for key, widget in list(self.signal_widgets.items()):
+            if key not in active_keys:
+                self.signal_grid.removeWidget(widget)
+                widget.setParent(None)
+                widget.deleteLater()
+                del self.signal_widgets[key]
+
+        for idx, rec in enumerate(records):
+            key = rec.get("recordKey")
+            widget = self.signal_widgets.get(key)
+            if widget is None:
+                widget = TrafficLightWidget()
+                self.signal_widgets[key] = widget
+
+            row = idx // 3
+            col = idx % 3
+            self.signal_grid.addWidget(widget, row, col)
+            widget.update_state(
+                rec.get("intersection_id"),
+                rec.get("signalGroup"),
+                rec.get("eventState"),
+                rec.get("remainingSeconds"),
+                rec.get("movementsText"),
+                rec.get("sourceLane"),
+            )
 
     def _update_sdsm_table(self):
         self.tbl_sdsm.setRowCount(0)
@@ -1343,6 +2163,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def show_all(self):
         lane_records = self._collect_all_lane_records()
         object_records = self._collect_all_sdsm_object_records()
+        signal_records = self._collect_spat_signal_records()
 
         pts = []
         for rec in lane_records:
@@ -1350,6 +2171,11 @@ class MainWindow(QtWidgets.QMainWindow):
         for ob in object_records:
             xm = ob.get("x_m")
             ym = ob.get("y_m")
+            if isinstance(xm, (int, float)) and isinstance(ym, (int, float)):
+                pts.append((xm, ym))
+        for sig in signal_records:
+            xm = sig.get("x_m")
+            ym = sig.get("y_m")
             if isinstance(xm, (int, float)) and isinstance(ym, (int, float)):
                 pts.append((xm, ym))
 
@@ -1360,7 +2186,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def redraw_overlay_only(self):
         lane_records = self._collect_all_lane_records()
         object_records = self._collect_all_sdsm_object_records()
-        self.view.draw_world(lane_records, object_records)
+        signal_records = self._collect_spat_signal_records()
+        self.view.draw_world(lane_records, object_records, signal_records)
 
     def initialize_ui_once(self):
         if self.ui_frozen:
@@ -1406,6 +2233,7 @@ class MainWindow(QtWidgets.QMainWindow):
         map_added = False
         overlay_updated = False
         objects_added = False
+        spat_updated = False
 
         while drained < 400:
             try:
@@ -1441,6 +2269,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     lane_polylines_global = convert_map_polylines_to_global(
                         ref_lat_deg, ref_lon_deg, lane_polylines_local
                     )
+                    signal_group_movements = extract_map_signal_group_movements(
+                        it.get("laneSet")
+                    )
 
                     self.map_store[iid] = {
                         "name": nm,
@@ -1448,6 +2279,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         "ref_lon_deg": ref_lon_deg,
                         "lane_polylines_local": lane_polylines_local,
                         "lane_polylines_global": lane_polylines_global,
+                        "signal_group_movements": signal_group_movements,
                         "last_ts": ts,
                     }
                     map_added = True
@@ -1460,12 +2292,15 @@ class MainWindow(QtWidgets.QMainWindow):
                     continue
 
                 self.spat_store[iid] = {
+                    "moy": spat.get("moy"),
+                    "timeStamp": spat.get("timeStamp"),
                     "states": spat.get("states", []),
                     "last_ts": ts,
+                    "last_update_monotonic": time.monotonic(),
                 }
 
-                if not self.ui_frozen:
-                    overlay_updated = True
+                overlay_updated = True
+                spat_updated = True
 
             elif kind == "SDSM":
                 sd = extract_sdsm(decoded)
@@ -1487,8 +2322,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 if sd.get("objects"):
                     objects_added = True
 
+        if drained == 0 and self.spat_store:
+            self._update_spat_table()
+            self.redraw_overlay_only()
+            return
+
         if map_added:
-            self.initialize_ui_once()
+            if self.ui_frozen:
+                self._update_intersection_dropdown()
+            else:
+                self.initialize_ui_once()
+
+        if spat_updated:
+            self._update_spat_table()
 
         if overlay_updated:
             if self.ui_frozen:

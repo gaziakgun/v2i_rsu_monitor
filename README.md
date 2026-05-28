@@ -1,7 +1,7 @@
 v2i_rsu_monitor
 ================
 
-ROS2 wrapper for `test6.py` GUI RSU monitor. The node subscribes to raw ASN.1 message bytes on these topics:
+ROS2 wrapper for `test6.py` GUI RSU monitor. The node subscribes to decoded V2I ROS messages on these topics:
 
 - `v2i/sdsm/raw`  (SDSM messages)
 - `v2i/map/raw`   (MAP messages)
@@ -9,8 +9,8 @@ ROS2 wrapper for `test6.py` GUI RSU monitor. The node subscribes to raw ASN.1 me
 
 The monitor supports two input formats:
 
-- Custom decoded bag topics: `v2i_sdsm_msgs/msg/SDSM` on `/v2i/sdsm/raw` and `v2i_spat_msgs/msg/SpatPacket` on `/v2i/spat/raw`.
-- Raw ASN.1 byte topics: `std_msgs/UInt8MultiArray` where `data` is a list of bytes (0-255).
+- Custom decoded bag topics: `v2i_sdsm_msgs/msg/SDSM` on `/v2i/sdsm/raw`, `v2i_map_msgs/msg/MapData` on `/v2i/map/raw`, and `v2i_spat_msgs/msg/SpatPacket` on `/v2i/spat/raw`.
+- Raw ASN.1 byte topics: `std_msgs/UInt8MultiArray` where `data` is a list of bytes (0-255). This fallback is used when the custom message packages are not available in the sourced ROS environment.
 
 The node decodes ASN.1 using `pycmssdk` when byte topics are used and renders the GUI with PyQt5.
 
@@ -37,7 +37,7 @@ From the workspace root (the folder containing this package), run:
 
 ```bash
 # source your ROS2 install first, e.g. source /opt/ros/humble/setup.bash
-# source the workspace that contains v2i_sdsm_msgs/v2i_spat_msgs if using custom bag topics
+# source the workspace that contains v2i_map_msgs/v2i_sdsm_msgs/v2i_spat_msgs if using custom bag topics
 source ~/ros2_ws/install/setup.bash
 colcon build --packages-select v2i_rsu_monitor
 source install/setup.bash
