@@ -1,7 +1,7 @@
 v2i_rsu_monitor
 ================
 
-ROS2 wrapper for `test6.py` GUI RSU monitor. The node subscribes to decoded V2I ROS messages on these topics:
+GUI RSU monitor. The node subscribes to decoded V2I ROS messages on these topics:
 
 - `v2i/sdsm/raw`  (SDSM messages)
 - `v2i/map/raw`   (MAP messages)
@@ -22,7 +22,19 @@ Quickstart
 1. Prerequisites
 
 - ROS 2 installed and sourced (Foxy, Humble, or later — ensure your distro matches installed Python packages).
+- Custom V2I message packages from [`omerdurmus61/autoware_v2i_interfaces`](https://github.com/omerdurmus61/autoware_v2i_interfaces): `v2i_map_msgs`, `v2i_sdsm_msgs`, and `v2i_spat_msgs`.
 - Python packages: `pycmssdk` and `PyQt5`.
+
+Install the V2I message packages in a ROS 2 workspace before building this monitor:
+
+```bash
+cd ~/ros2_ws/src
+git clone https://github.com/omerdurmus61/autoware_v2i_interfaces.git
+cd ..
+source /opt/ros/humble/setup.bash
+colcon build --packages-select v2i_map_msgs v2i_sdsm_msgs v2i_spat_msgs
+source install/setup.bash
+```
 
 If you have the wheel in this repo, install it into your active Python environment:
 
@@ -37,7 +49,7 @@ From the workspace root (the folder containing this package), run:
 
 ```bash
 # source your ROS2 install first, e.g. source /opt/ros/humble/setup.bash
-# source the workspace that contains v2i_map_msgs/v2i_sdsm_msgs/v2i_spat_msgs if using custom bag topics
+# source the workspace that contains v2i_map_msgs/v2i_sdsm_msgs/v2i_spat_msgs
 source ~/ros2_ws/install/setup.bash
 colcon build --packages-select v2i_rsu_monitor
 source install/setup.bash
@@ -85,19 +97,6 @@ pub.publish(msg)
 node.destroy_node()
 rclpy.shutdown()
 PY
-```
+``
 
-Notes and troubleshooting
--------------------------
 
-- The node uses `pycmssdk` to decode US_MESSAGE_FRAME ASN.1. Make sure the wheel you have matches your Python version and is installed in the same environment used to run ROS2 nodes.
-- If the GUI fails to start due to missing Qt platform plugins, ensure `PyQt5` is installed and your DISPLAY environment is set (for remote displays, use X11 forwarding or a nested compositor).
-- If you prefer headless usage (no GUI), I can add a flag or a separate CLI mode that only logs parsed MAP/SPAT/SDSM to stdout or to JSONL files.
-
-Next steps
-----------
-
-- I can add a `launch` file for ROS2 to start the node with parameters.
-- I can add a headless/replay utility to publish JSONL log entries into the topics for testing.
-
-If you want, I can now add a `launch` file and a small Python replay script — which would you prefer?
